@@ -20,16 +20,18 @@ import Control.Monad.Identity (Identity)
 import Control.Monad (void)
 import Control.Monad.Writer (Writer, execWriter, tell, censor)
 import Data.Char
+import Data.Either
 import Data.Foldable (toList)
 import Data.Int
 import Data.List (intercalate)
-import Data.Sequence (singleton)
+import Data.Sequence (singleton, fromList)
 import Data.Traversable
 import Data.Word
 import Text.Parsec
 import Text.Printf
 import Text.ProtocolBuffers.Basic
 import Text.Read
+import Debug.Trace
 
 import qualified Data.ByteString.Lazy.Char8 as C8
 import qualified Data.ByteString.Lazy.UTF8 as U8
@@ -47,6 +49,8 @@ class TextMsg a where
 class TextType a where
     tellT :: String -> a -> Output
     getT :: Stream s Identity Char => String -> Parsec s () a
+    getT = getScalar toT
+    toT :: Stream s Identity Char => Parsec s () a
 
 tells :: String -> Output
 tells s = tell $ singleton (0, s)
@@ -75,51 +79,54 @@ dumpDecimal = C8.foldr escape []
 
 instance TextType Int32 where
     tellT = tellShow
-    getT = getScalar integer
+    toT = integer
 
 instance TextType Int64 where
     tellT = tellShow
-    getT = getScalar integer
+    toT = integer
 
 instance TextType Word32 where
     tellT = tellShow
-    getT = getScalar natural
+    toT = natural
 
 instance TextType Word64 where
     tellT = tellShow
-    getT = getScalar natural
+    toT = natural
 
 instance TextType Bool where
     tellT name True = tells $ name ++ ": true"
     tellT name False = tells $ name ++ ": false"
-    getT name = do
-        v <- getScalar (string "true" <|> string "false") name
-        return (v == "true")
+    toT = (string "true" <|> string "false") >>= \v -> return (v == "true")
 
 instance TextType Double where
     tellT = tellShow
-    getT = getScalar float
+    toT = float
 
 instance TextType Float where
     tellT = tellShow
-    getT name = realToFrac <$> getScalar float name
+    toT = realToFrac <$> float
 
 instance TextType Utf8 where
     tellT name (Utf8 s) = tellStr name s
-    getT name = uFromString <$> getScalar stringLiteral name
+    toT = uFromString <$> stringLiteral
 
 instance TextType ByteString where
     tellT = tellStr
-    getT name = U8.fromString <$> getScalar stringLiteral name
+    toT = U8.fromString <$> stringLiteral
 
 instance TextType a => TextType (Maybe a) where
     tellT _ Nothing = return ()
     tellT name (Just v) = tellT name v
     getT name = Just <$> getT name
+    toT = Just <$> toT
 
-instance TextType a => TextType (Seq a) where
+instance (TextType a) => TextType (Seq a) where
     tellT name xs = void $ forM xs $ tellT name
-    getT = error "should not take sequence directly"
+    toT = fromList <$> p2
+          where p1 :: Stream s Identity Char => Parsec s () [a]
+                p1 = T.commaSep lexer toT
+                p2 :: Stream s Identity Char => Parsec s () [a]
+                p2 = T.brackets lexer p1
 
 -- | This writes message as text-format protobuf to 'String'
 messagePutText :: TextMsg a => a -> String
@@ -158,7 +165,7 @@ integer :: (Integral a, Stream s Identity Char) => Parsec s () a
 integer = fromIntegral <$> T.integer lexer
 
 float :: Stream s Identity Char => Parsec s () Double
-float = T.float lexer
+float = either realToFrac id <$> T.naturalOrFloat lexer
 
 stringLiteral :: Stream s Identity Char => Parsec s () String
 stringLiteral = T.stringLiteral lexer
